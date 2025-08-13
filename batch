@@ -1,0 +1,6 @@
+git init
+git add .
+git commit -m "Initial commit: minimal React client"
+git branch -M main
+git remote add origin https://github.com/ngothing-hub/poker-client.git
+git push -u origin main
