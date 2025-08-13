@@ -1,0 +1,558 @@
+import React, { useMemo, useState, useEffect, useRef } from "react";
+
+// --- Poker Prototype (client-only) ---
+// Notes:
+// - Texas Hold'em, single table, you + bots, play-money only.
+// - Simplified fixed-limit betting. No real money. Not production-grade RNG.
+// - All logic runs in-browser for easy testing/demo.
+// ---------------------------------------------------------------
+
+// Card helpers
+const SUITS = ["♠", "♥", "♦", "♣"];
+const RANKS = ["2", "3", "4", "5", "6", "7", "8", "9", "T", "J", "Q", "K", "A"];
+
+function makeDeck() {
+  const deck = [];
+  for (const s of SUITS) {
+    for (const r of RANKS) deck.push(r + s);
+  }
+  return deck;
+}
+function shuffle(arr) {
+  const a = arr.slice();
+  // Fisher-Yates
+  for (let i = a.length - 1; i > 0; i--) {
+    const j = Math.floor(Math.random() * (i + 1));
+    [a[i], a[j]] = [a[j], a[i]];
+  }
+  return a;
+}
+
+function rankToValue(r) {
+  return RANKS.indexOf(r[0]);
+}
+
+// Hand evaluation (7 cards -> best 5)
+// Returns a comparable score array: [category, ...kickers] higher is better
+// Categories: 8=StraightFlush, 7=FourKind, 6=FullHouse, 5=Flush, 4=Straight, 3=Trips, 2=TwoPair, 1=Pair, 0=High
+function evaluate7(cards7) {
+  // create arrays for suits/ranks counts
+  const ranks = cards7.map(c => c[0]);
+  const suits = cards7.map(c => c[1]);
+
+  // rank counts
+  const cnt = new Map();
+  for (const r of ranks) cnt.set(r, (cnt.get(r) || 0) + 1);
+  // suit buckets
+  const suitBucket = new Map();
+  for (const c of cards7) {
+    const s = c[1];
+    if (!suitBucket.has(s)) suitBucket.set(s, []);
+    suitBucket.get(s).push(c);
+  }
+
+  // helper to get sorted ranks (by value desc), breaking ties by rank value
+  const byRankDesc = (arr) => arr.sort((a,b)=> rankToValue(b) - rankToValue(a));
+
+  // Check Flush / Straight Flush
+  let flushCards = null;
+  for (const [s, list] of suitBucket.entries()) {
+    if (list.length >= 5) flushCards = byRankDesc(list.map(c => c[0]));
+  }
+
+  // Straight helper for array of ranks (characters), treating A as high and optionally as low for A-2-3-4-5
+  function bestStraightFromRanks(rankChars) {
+    // dedupe and sort by value desc
+    const uniq = Array.from(new Set(rankChars)).sort((a,b)=> rankToValue(b) - rankToValue(a));
+    // add Ace low support by appending '1' to represent A as low (value -1) trick
+    const mapped = uniq.map(r=>({r, v: rankToValue(r)}));
+    const hasA = uniq.includes('A');
+    if (hasA) mapped.push({r:'A', v:-1});
+    let bestHigh = null;
+    let streak = 1;
+    for (let i=0;i<mapped.length;i++){
+      if (i>0 && mapped[i-1].v - 1 === mapped[i].v) {
+        streak++;
+      } else if (i>0 && mapped[i-1].v === mapped[i].v) {
+        // skip equal
+      } else {
+        streak = 1;
+      }
+      if (streak >= 5) bestHigh = mapped[i-4].r; // the highest card of the 5-long run
+    }
+    return bestHigh; // returns rank char of the high card of straight
+  }
+
+  // Straight Flush
+  if (flushCards) {
+    const sfHigh = bestStraightFromRanks(flushCards);
+    if (sfHigh) {
+      return [8, rankToValue(sfHigh)];
+    }
+  }
+
+  // Four of a kind
+  const quads = Array.from(cnt.entries()).filter(([r,n])=>n===4).map(([r])=>r);
+  if (quads.length) {
+    const quad = quads.sort((a,b)=>rankToValue(b)-rankToValue(a))[0];
+    const kickers = byRankDesc(ranks.filter(r=>r!==quad));
+    return [7, rankToValue(quad), rankToValue(kickers[0])];
+  }
+
+  // Trips and Pairs
+  const trips = Array.from(cnt.entries()).filter(([r,n])=>n===3).map(([r])=>r).sort((a,b)=>rankToValue(b)-rankToValue(a));
+  const pairs = Array.from(cnt.entries()).filter(([r,n])=>n===2).map(([r])=>r).sort((a,b)=>rankToValue(b)-rankToValue(a));
+
+  // Full House
+  if (trips.length && (pairs.length || trips.length>1)){
+    const trip = trips[0];
+    const pair = pairs.length ? pairs[0] : trips[1];
+    return [6, rankToValue(trip), rankToValue(pair)];
+  }
+
+  // Flush
+  if (flushCards) {
+    const top5 = flushCards.slice(0,5).map(rankToValue);
+    return [5, ...top5];
+  }
+
+  // Straight
+  const straightHigh = bestStraightFromRanks(ranks);
+  if (straightHigh) return [4, rankToValue(straightHigh)];
+
+  // Trips
+  if (trips.length){
+    const kickers = byRankDesc(ranks.filter(r=>r!==trips[0])).slice(0,2).map(rankToValue);
+    return [3, rankToValue(trips[0]), ...kickers];
+  }
+
+  // Two Pair
+  if (pairs.length>=2){
+    const [p1,p2] = pairs.slice(0,2);
+    const kickers = byRankDesc(ranks.filter(r=>r!==p1 && r!==p2));
+    return [2, rankToValue(p1), rankToValue(p2), rankToValue(kickers[0])];
+  }
+
+  // One Pair
+  if (pairs.length===1){
+    const p = pairs[0];
+    const kickers = byRankDesc(ranks.filter(r=>r!==p)).slice(0,3).map(rankToValue);
+    return [1, rankToValue(p), ...kickers];
+  }
+
+  // High card
+  const highs = byRankDesc(ranks).slice(0,5).map(rankToValue);
+  return [0, ...highs];
+}
+
+function handName(score){
+  const cat = score[0];
+  switch(cat){
+    case 8: return "Straight Flush";
+    case 7: return "Four of a Kind";
+    case 6: return "Full House";
+    case 5: return "Flush";
+    case 4: return "Straight";
+    case 3: return "Three of a Kind";
+    case 2: return "Two Pair";
+    case 1: return "One Pair";
+    default: return "High Card";
+  }
+}
+
+// Simple bot decision (naive):
+// - Preflop: fold worst ~30% hands randomly; else call
+// - Postflop: use evaluate strength to decide
+function botAct({ stage, toCall, chips, cards, board }){
+  if (chips <= 0) return { type: "check" };
+  const rand = Math.random();
+  const strength = stage === 'preflop' ? Math.random() : evaluate7([...cards, ...board]).join(',');
+  if (toCall === 0) {
+    // sometimes bet small
+    if (rand < 0.15) return { type: "bet", amount: 10 };
+    return { type: "check" };
+  } else {
+    if (stage === 'preflop') {
+      if (rand < 0.3) return { type: "fold" };
+      return { type: "call" };
+    }
+    // postflop naive: call more often, rare fold
+    if (rand < 0.1) return { type: "fold" };
+    if (rand < 0.85) return { type: "call" };
+    return { type: "raise", amount: 10 };
+  }
+}
+
+const STAGES = ["preflop","flop","turn","river","showdown"];
+
+export default function PokerPrototype(){
+  const [name, setName] = useState("");
+  const [entered, setEntered] = useState(false);
+  const [chips, setChips] = useState(1000);
+  const [dailyClaimed, setDailyClaimed] = useState(false);
+
+  const [players, setPlayers] = useState([]); // [{id, name, chips, cards, folded, isBot}]
+  const [buttonPos, setButtonPos] = useState(0);
+  const [pot, setPot] = useState(0);
+  const [board, setBoard] = useState([]);
+  const [stage, setStage] = useState("preflop");
+  const [toAct, setToAct] = useState(0);
+  const [currentBet, setCurrentBet] = useState(0);
+  const [bettingRoundBets, setBettingRoundBets] = useState({}); // id -> amount put in this round
+  const [message, setMessage] = useState("");
+  const deckRef = useRef([]);
+
+  // Persist simple state in localStorage
+  useEffect(()=>{
+    const s = localStorage.getItem("poker_demo");
+    if (s){
+      try{
+        const obj = JSON.parse(s);
+        setName(obj.name||"");
+        setEntered(obj.entered||false);
+        setChips(obj.chips ?? 1000);
+        setDailyClaimed(obj.dailyClaimed||false);
+      }catch(e){}
+    }
+  },[]);
+  useEffect(()=>{
+    localStorage.setItem("poker_demo", JSON.stringify({name, entered, chips, dailyClaimed}));
+  },[name, entered, chips, dailyClaimed]);
+
+  function claimDaily(){
+    if (dailyClaimed) return;
+    setChips(c=>c+500);
+    setDailyClaimed(true);
+  }
+
+  function startTable(botCount=3){
+    const seats = [];
+    const me = { id: "me", name: name||"You", chips, cards: [], folded:false, isBot:false };
+    seats.push(me);
+    for (let i=0;i<botCount;i++) seats.push({ id: "b"+i, name: "Bot "+(i+1), chips: 1000, cards: [], folded:false, isBot:true });
+    setPlayers(seats);
+    setButtonPos(0);
+    newHand(seats, 0);
+  }
+
+  function postBlind(seats, pos, amount){
+    const p = seats[pos];
+    const bet = Math.min(amount, p.chips);
+    p.chips -= bet; setPot(v=>v+bet);
+    setBettingRoundBets(s=>({ ...s, [p.id]: (s[p.id]||0) + bet }));
+  }
+
+  function newHand(initialSeats=players, btn=buttonPos){
+    let seats = initialSeats.map(p=>({ ...p, cards:[], folded:false }));
+    deckRef.current = shuffle(makeDeck());
+    setBoard([]);
+    setPot(0);
+    setCurrentBet(0);
+    setBettingRoundBets({});
+    setStage("preflop");
+
+    // deal two cards each
+    for (let r=0;r<2;r++) for (let i=0;i<seats.length;i++) seats[i].cards.push(deckRef.current.pop());
+
+    setPlayers(seats);
+
+    // blinds (SB=5, BB=10)
+    const sbPos = (btn+1)%seats.length;
+    const bbPos = (btn+2)%seats.length;
+    postBlind(seats, sbPos, 5);
+    postBlind(seats, bbPos, 10);
+    setCurrentBet(10);
+
+    // first to act = UTG
+    setToAct((btn+3)%seats.length);
+    setMessage("New hand! Your move when it's your turn.");
+  }
+
+  function nextToAct(idx, seats=players){
+    const n = seats.length;
+    for (let k=1;k<=n;k++){
+      const j = (idx + k) % n;
+      if (!seats[j].folded && seats[j].chips>=0) return j;
+    }
+    return idx;
+  }
+
+  function allCalledOrFolded(){
+    // all remaining players have matched currentBet in this round
+    const alive = players.filter(p=>!p.folded);
+    return alive.every(p => (bettingRoundBets[p.id]||0) >= currentBet || p.chips===0);
+  }
+
+  function advanceStage(){
+    setBettingRoundBets({});
+    setCurrentBet(0);
+    if (stage === 'preflop') {
+      // burn 1, flop 3
+      deckRef.current.pop();
+      setBoard(b=>[...b, deckRef.current.pop(), deckRef.current.pop(), deckRef.current.pop()]);
+      setStage('flop');
+    } else if (stage === 'flop'){
+      deckRef.current.pop();
+      setBoard(b=>[...b, deckRef.current.pop()]);
+      setStage('turn');
+    } else if (stage === 'turn'){
+      deckRef.current.pop();
+      setBoard(b=>[...b, deckRef.current.pop()]);
+      setStage('river');
+    } else if (stage === 'river'){
+      setStage('showdown');
+      doShowdown();
+      return;
+    }
+    // set first to act = left of button who hasn't folded
+    const idx = nextToAct(buttonPos);
+    setToAct(idx);
+  }
+
+  function doShowdown(){
+    const alive = players.filter(p=>!p.folded);
+    const results = alive.map(p=>({ id:p.id, name:p.name, score: evaluate7([...p.cards, ...board]), cards:p.cards }));
+    results.sort((a,b)=>{
+      // compare score arrays lexicographically
+      for (let i=0;i<Math.max(a.score.length,b.score.length);i++){
+        const av = a.score[i]??-1; const bv = b.score[i]??-1;
+        if (av!==bv) return bv-av;
+      }
+      return 0;
+    });
+    const winner = results[0];
+    setMessage(`Showdown: ${winner.name} wins with ${handName(winner.score)}.`);
+    // split pot equally among top ties
+    const topScore = results[0].score.join(',');
+    const tied = results.filter(r=> r.score.join(',')===topScore);
+    const share = Math.floor(pot / tied.length);
+    setPlayers(ps=> ps.map(p=> tied.find(t=>t.id===p.id) ? {...p, chips: p.chips + share } : p));
+    setPot(0);
+    // rotate button and start next hand after delay
+    setTimeout(()=>{
+      const nextBtn = (buttonPos + 1) % players.length;
+      setButtonPos(nextBtn);
+      newHand(players, nextBtn);
+    }, 2000);
+  }
+
+  function actFold(){
+    if (stage==="showdown") return;
+    setPlayers(ps=>{
+      const arr = ps.slice();
+      arr[toAct] = { ...arr[toAct], folded:true };
+      return arr;
+    });
+    // if only one left, award pot
+    setTimeout(()=>{
+      const alive = players.filter((p,i)=> !(i===toAct) && !p.folded);
+      if (alive.length===1){
+        const winnerId = alive[0].id;
+        setPlayers(ps=> ps.map(p=> p.id===winnerId ? {...p, chips:p.chips+pot} : p));
+        setPot(0);
+        setMessage(`${alive[0].name} wins by everyone folding.`);
+        setTimeout(()=>{
+          const nextBtn = (buttonPos + 1) % players.length;
+          setButtonPos(nextBtn);
+          newHand(players, nextBtn);
+        }, 1500);
+        return;
+      }
+      // else move to next player
+      setToAct(i=> nextToAct(i));
+    }, 50);
+  }
+
+  function contribute(player, amount){
+    const a = Math.min(amount, player.chips);
+    if (a<=0) return 0;
+    player.chips -= a;
+    setPot(p=>p+a);
+    setBettingRoundBets(s=>({ ...s, [player.id]: (s[player.id]||0) + a }));
+    return a;
+  }
+
+  function actCheckCall(){
+    const me = players[toAct];
+    const put = bettingRoundBets[me.id] || 0;
+    const need = Math.max(0, currentBet - put);
+    contribute(me, need);
+    // next
+    const next = nextToAct(toAct);
+    setToAct(next);
+  }
+
+  function actBetRaise(amount=10){
+    const me = players[toAct];
+    const put = bettingRoundBets[me.id] || 0;
+    const need = Math.max(0, currentBet - put) + amount;
+    const paid = contribute(me, need);
+    setCurrentBet(put + paid);
+    // move to next
+    setToAct(nextToAct(toAct));
+  }
+
+  // Progress betting round automatically when everyone has acted
+  useEffect(()=>{
+    if (!players.length) return;
+    if (stage==="showdown") return;
+    // if toAct is a bot, let it act with small delay
+    const p = players[toAct];
+    if (!p) return;
+    if (p.folded) { setToAct(nextToAct(toAct)); return; }
+
+    // if round finished
+    if (allCalledOrFolded()){
+      // advance to next stage
+      const t = setTimeout(()=> advanceStage(), 600);
+      return ()=> clearTimeout(t);
+    }
+
+    if (p.isBot){
+      const toCall = Math.max(0, currentBet - (bettingRoundBets[p.id]||0));
+      const decision = botAct({ stage, toCall, chips:p.chips, cards:p.cards, board });
+      const t = setTimeout(()=>{
+        if (decision.type === 'fold') actFold();
+        else if (decision.type === 'check') actCheckCall();
+        else if (decision.type === 'call') actCheckCall();
+        else if (decision.type === 'bet') actBetRaise(decision.amount||10);
+        else if (decision.type === 'raise') actBetRaise(decision.amount||10);
+      }, 500 + Math.random()*600);
+      return ()=> clearTimeout(t);
+    }
+  }, [toAct, players, stage, currentBet, bettingRoundBets, board]);
+
+  // Style helpers
+  const Card = ({c})=>{
+    if (!c) return <div className="w-10 h-14 bg-slate-700/40 rounded-xl"/>;
+    const red = c[1]==='♥' || c[1]==='♦';
+    return (
+      <div className={`w-12 h-16 rounded-xl shadow-md border flex items-center justify-center text-xl font-semibold bg-white ${red?"text-red-600":"text-slate-800"}`}>
+        {c}
+      </div>
+    );
+  };
+
+  const Seat = ({p, me})=>{
+    const hidden = p.isBot ? ["🂠","🂠"] : p.cards;
+    return (
+      <div className={`p-3 rounded-2xl bg-slate-800/40 border border-slate-700 min-w-[180px] ${p.folded?"opacity-40": ""}`}>
+        <div className="flex items-center justify-between mb-2">
+          <div className="font-semibold">{p.name}{me?" (you)":""}</div>
+          <div className="text-sm">🪙 {p.chips}</div>
+        </div>
+        <div className="flex gap-2">
+          {p.isBot ? (
+            <>
+              <div className="w-12 h-16 rounded-xl bg-slate-600/60 border border-slate-500 flex items-center justify-center">🂠</div>
+              <div className="w-12 h-16 rounded-xl bg-slate-600/60 border border-slate-500 flex items-center justify-center">🂠</div>
+            </>
+          ) : (
+            <>
+              <Card c={p.cards[0]}/>
+              <Card c={p.cards[1]}/>
+            </>
+          )}
+        </div>
+      </div>
+    );
+  };
+
+  return (
+    <div className="min-h-screen w-full bg-gradient-to-b from-slate-900 to-slate-950 text-slate-100 p-6">
+      <div className="max-w-6xl mx-auto">
+        <header className="flex items-center justify-between mb-6">
+          <h1 className="text-2xl md:text-3xl font-bold">♣️ Poker Prototype — Play Money Only</h1>
+          <div className="text-xs md:text-sm opacity-80">Client-only demo · No real money · RNG for testing only</div>
+        </header>
+
+        {!entered ? (
+          <div className="grid md:grid-cols-2 gap-6">
+            <div className="p-5 rounded-2xl border border-slate-800 bg-slate-900/60 shadow">
+              <div className="mb-3 text-lg font-semibold">Тоглогчийн нэр</div>
+              <input value={name} onChange={e=>setName(e.target.value)} placeholder="Нэрээ оруулна уу" className="w-full p-3 rounded-xl bg-slate-800 border border-slate-700 outline-none"/>
+              <div className="flex items-center gap-3 mt-4">
+                <button onClick={()=>{ setEntered(true); }} className="px-4 py-2 rounded-xl bg-emerald-600 hover:bg-emerald-500 transition shadow">Эхлэх</button>
+                <button onClick={claimDaily} disabled={dailyClaimed} className="px-4 py-2 rounded-xl bg-indigo-600 hover:bg-indigo-500 transition disabled:opacity-50">Өдрийн жетон (+500)</button>
+                <div className="ml-auto text-sm">Жетон: <span className="font-semibold">{chips}</span></div>
+              </div>
+              <p className="text-xs opacity-70 mt-3">Зөвхөн туршилтын зориулалттай. Бодит мөнгө хэрэглэхгүй.</p>
+            </div>
+            <div className="p-5 rounded-2xl border border-slate-800 bg-slate-900/60 shadow">
+              <div className="mb-3 text-lg font-semibold">Тайлбар</div>
+              <ul className="list-disc pl-5 space-y-1 text-sm opacity-90">
+                <li>Texas Hold'em — та + 3 бот.</li>
+                <li>Фикс лимит (SB 5 / BB 10), ээлж бүрд check/call/fold/raise 10.</li>
+                <li>Шударга тоглолтын үнэлгээ хөнгөн логикоор гүйцэтгэнэ.</li>
+                <li>Шоудаун дээр ялагчид банкнаас хуваарилна.</li>
+              </ul>
+              <div className="mt-4 flex gap-2">
+                <button onClick={()=>startTable(3)} className="px-4 py-2 rounded-xl bg-blue-600 hover:bg-blue-500 transition shadow">3 боттой ширээ нээх</button>
+                <button onClick={()=>startTable(5)} className="px-4 py-2 rounded-xl bg-blue-700 hover:bg-blue-600 transition shadow">5 боттой ширээ</button>
+              </div>
+            </div>
+          </div>
+        ) : (
+          <div className="grid lg:grid-cols-4 gap-6">
+            <div className="lg:col-span-3 p-4 rounded-2xl border border-slate-800 bg-slate-900/60 shadow">
+              <div className="flex items-center justify-between mb-3">
+                <div className="text-sm">Stage: <span className="font-semibold uppercase">{stage}</span></div>
+                <div className="text-sm">Pot: <span className="font-semibold">🪙 {pot}</span></div>
+                <div className="text-sm">Current Bet: <span className="font-semibold">{currentBet}</span></div>
+              </div>
+
+              {/* Board */}
+              <div className="flex items-center gap-2 justify-center mb-4">
+                <Card c={board[0]}/>
+                <Card c={board[1]}/>
+                <Card c={board[2]}/>
+                <Card c={board[3]}/>
+                <Card c={board[4]}/>
+              </div>
+
+              {/* Seats */}
+              {players.length ? (
+                <div className="grid md:grid-cols-2 xl:grid-cols-3 gap-3">
+                  {players.map((p, idx)=> (
+                    <div key={p.id} className={`relative ${idx===toAct?"ring-2 ring-emerald-500 rounded-2xl": ""}`}>
+                      <Seat p={p} me={p.id==='me'}/>
+                      {idx===buttonPos && <div className="absolute -top-2 -right-2 bg-yellow-400 text-black text-xs px-2 py-1 rounded-full shadow">BTN</div>}
+                    </div>
+                  ))}
+                </div>
+              ) : (
+                <div className="text-sm opacity-80">Ширээ эхлүүлэхийн тулд дээрх товчоос сонгоно уу.</div>
+              )}
+
+              {/* Actions */}
+              {players.length>0 && players[toAct] && players[toAct].id==='me' && stage!=="showdown" && (
+                <div className="mt-4 flex flex-wrap gap-2 items-center">
+                  <button onClick={actFold} className="px-4 py-2 rounded-xl bg-rose-600 hover:bg-rose-500">Fold</button>
+                  <button onClick={actCheckCall} className="px-4 py-2 rounded-xl bg-slate-700 hover:bg-slate-600">Check / Call</button>
+                  <button onClick={()=>actBetRaise(10)} className="px-4 py-2 rounded-xl bg-emerald-600 hover:bg-emerald-500">Bet / Raise +10</button>
+                </div>
+              )}
+
+              <div className="mt-4 text-sm opacity-90 min-h-[24px]">{message}</div>
+            </div>
+
+            <div className="lg:col-span-1 p-4 rounded-2xl border border-slate-800 bg-slate-900/60 shadow">
+              <div className="text-lg font-semibold mb-3">Тохиргоо</div>
+              <div className="space-y-2 text-sm">
+                <div>Тоглогч: <span className="font-semibold">{name||"You"}</span></div>
+                <div>Жетон: <span className="font-semibold">{chips}</span></div>
+                <div className="flex gap-2 mt-2">
+                  <button onClick={()=>{ setEntered(false); }} className="px-3 py-2 rounded-xl bg-slate-700 hover:bg-slate-600">Лобби руу</button>
+                  <button onClick={()=>{ setDailyClaimed(false); }} className="px-3 py-2 rounded-xl bg-slate-700 hover:bg-slate-600">Өдрийн жетон сэргээх</button>
+                </div>
+                <div className="mt-4 text-xs opacity-70">
+                  Анхаар: Энэ бол зөвхөн туршилтын прототип. Реал-тайм олон тоглогчийн горим, сервер талын RNG, хяналт аюулгүй байдал ороогүй.
+                </div>
+              </div>
+            </div>
+          </div>
+        )}
+      </div>
+    </div>
+  );
+}
