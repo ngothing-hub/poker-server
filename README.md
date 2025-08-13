@@ -1,28 +1,15 @@
-const express = require("express");
-const http = require("http");
-const cors = require("cors");
-const { Server } = require("socket.io");
+# Poker Server — Demo Multiplayer
 
-const app = express();
-app.use(cors());
+Node.js + Socket.IO server for a demo Poker game.
 
-const server = http.createServer(app);
-const io = new Server(server, {
-  cors: { origin: "*", methods: ["GET", "POST"] }
-});
+## Local setup
+git clone https://github.com/ngothing-hub/poker-server.git
+cd poker-server
+npm install
+npm start
 
-io.on("connection", (socket) => {
-  console.log("Player connected:", socket.id);
-  socket.on("disconnect", () => {
-    console.log("Player disconnected:", socket.id);
-  });
-});
+Server runs on http://localhost:8080
 
-app.get("/", (req, res) => {
-  res.send("Poker server is running 🚀");
-});
-
-const PORT = process.env.PORT || 8080;
-server.listen(PORT, () => {
-  console.log(`Server running on port ${PORT}`);
-});
+## Deployment
+- Deploy to Render.com: Build: npm install, Start: npm start
+- Live URL: Render will provide it
