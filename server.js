@@ -4,7 +4,13 @@ const io = new Server(server, {
     methods: ["GET", "POST"]
   }
 });
-const express = require("express");
+const express = require("express");const io = new Server(server, {
+  cors: {
+    origin: "*", // эсвэл Vercel client URL: https://poker-client-demo.vercel.app
+    methods: ["GET", "POST"]
+  }
+});
+
 const http = require("http");
 const cors = require("cors");
 const { Server } = require("socket.io");
