@@ -1,5 +1,4 @@
-cd /path/to/poker-client
-{
+
   "name": "poker-server",
   "version": "1.0.0",
   "main": "server.js",
